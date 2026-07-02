@@ -1,53 +1,522 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# go-test-action
+name: "🧪 Go Test"
+description: "Runs go test with coverage and race detection support"
+# Wraps actions/setup-go and go test behind a validated interface.
+# Coverage and race detection default on; permit_fail supports a
+# non-blocking mode that reports failures without failing the job,
+# mirroring the soft-fail semantics used across the actions estate.
 
 inputs:
-  input:
-    description: "Description of input"
-    required: true
+  # Optional
+  go_version:
+    # yamllint disable-line rule:line-length
+    description: "Explicit Go version to install; takes precedence over go_version_file"
+    required: false
+    default: ""
+  go_version_file:
+    # yamllint disable-line rule:line-length
+    description: "File to read the Go version from, relative to path_prefix"
+    required: false
+    default: "go.mod"
+  path_prefix:
+    description: "Project directory; must resolve within the workspace"
+    required: false
+    default: "."
+  coverage:
+    description: "Collect coverage with -coverprofile: 'true' or 'false'"
+    required: false
+    default: "true"
+  race:
+    description: "Enable the race detector: 'true' or 'false'"
+    required: false
+    default: "true"
+  test_args:
+    # yamllint disable-line rule:line-length
+    description: "Extra go test flags; allowed characters: A-Z a-z 0-9 space . _ / = , : @ + -"
+    required: false
+    default: ""
+  test_target:
+    # yamllint disable-line rule:line-length
+    description: "Space-separated package pattern(s) to test; tokens must not start with '-'; allowed characters: A-Z a-z 0-9 space . _ / -"
+    required: false
+    default: "./..."
+  timeout:
+    # yamllint disable-line rule:line-length
+    description: "Go test timeout as a Go duration string, e.g. 10m or 1h30m"
+    required: false
+    default: "10m"
+  permit_fail:
+    # yamllint disable-line rule:line-length
+    description: "Report test failures without failing the action: 'true' or 'false'"
+    required: false
+    default: "false"
+  artifact_upload:
+    # yamllint disable-line rule:line-length
+    description: "Upload the coverage profile as an artifact; requires coverage; skips when the run produced no profile"
+    required: false
+    default: "false"
+  artifact_name:
+    description: "Artifact name; allowed characters: A-Z a-z 0-9 . _ -"
+    required: false
+    default: "go-coverage"
 
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  tests_passed:
+    description: "Whether the test run passed: 'true' or 'false'"
+    value: ${{ steps.test.outputs.tests_passed }}
+  coverage_percent:
+    # yamllint disable-line rule:line-length
+    description: "Total coverage percentage from go tool cover; empty when coverage is off, 0 when the run produced no profile"
+    value: ${{ steps.test.outputs.coverage_percent }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
+    - name: "Validate inputs"
+      id: validate
       shell: bash
       env:
-        INPUT_VALUE: ${{ inputs.input }}
+        INPUT_GO_VERSION: ${{ inputs.go_version }}
+        INPUT_GO_VERSION_FILE: ${{ inputs.go_version_file }}
+        INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
+        INPUT_COVERAGE: ${{ inputs.coverage }}
+        INPUT_RACE: ${{ inputs.race }}
+        INPUT_TEST_ARGS: ${{ inputs.test_args }}
+        INPUT_TEST_TARGET: ${{ inputs.test_target }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_PERMIT_FAIL: ${{ inputs.permit_fail }}
+        INPUT_ARTIFACT_UPLOAD: ${{ inputs.artifact_upload }}
+        INPUT_ARTIFACT_NAME: ${{ inputs.artifact_name }}
       run: |
-        # Friendly Name
-        input="$INPUT_VALUE"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
+        # Validate inputs
+        # Preflight: fail with a clear message when required tools are
+        # missing (possible on minimal self-hosted runners)
+        for tool in realpath awk; do
+          if ! command -v "${tool}" > /dev/null 2>&1; then
+            echo "Error: required tool not found: ${tool} ❌"
+            echo "This action requires realpath (GNU coreutils)"
+            echo "and awk on the runner"
+            exit 1
+          fi
+        done
+        # Probe for GNU coreutils realpath: BSD/macOS realpath lacks
+        # the -m option, and later path resolution expects GNU
+        # behaviour; failing here gives a clearer error than a
+        # misleading mid-run resolution failure
+        if ! realpath -m -- / > /dev/null 2>&1; then
+          echo "Error: realpath does not support the -m option ❌"
+          echo "This action requires GNU coreutils realpath"
           exit 1
         fi
-
-        # Write the output using the multiline heredoc format with a random
-        # delimiter so that an input containing newlines cannot inject
-        # additional keys into $GITHUB_OUTPUT (output-file injection). The
-        # delimiter is built from shell-builtin randomness (no external
-        # tools such as openssl/uuidgen, which are not guaranteed on
-        # self-hosted runners) and regenerated until it is provably absent
-        # from the value being emitted.
-        delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        while [[ "$input" == *"$delimiter"* ]]; do
-          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+        # The workspace boundary checks depend on this runner
+        # environment variable: an empty value would degrade the
+        # case patterns to /* and disable the escape checks
+        if [ -z "${GITHUB_WORKSPACE:-}" ] || \
+          [ ! -d "${GITHUB_WORKSPACE}" ]; then
+          echo "Error: GITHUB_WORKSPACE not set to a directory ❌"
+          echo "This action requires a standard runner environment"
+          exit 1
+        fi
+        # A case glob validates the entire string, including embedded
+        # newlines; grep would only validate per line
+        for bool_pair in \
+          "coverage:${INPUT_COVERAGE}" \
+          "race:${INPUT_RACE}" \
+          "permit_fail:${INPUT_PERMIT_FAIL}" \
+          "artifact_upload:${INPUT_ARTIFACT_UPLOAD}"; do
+          bool_name="${bool_pair%%:*}"
+          bool_value="${bool_pair#*:}"
+          case "${bool_value}" in
+            true|false) ;;
+            *)
+              echo "Error: ${bool_name} must be 'true' or 'false' ❌"
+              exit 1 ;;
+          esac
         done
+        if [ -n "${INPUT_GO_VERSION}" ]; then
+          case "${INPUT_GO_VERSION}" in
+            *[!0-9A-Za-z.-]*)
+              echo "Error: invalid go_version ❌"
+              echo "Allowed characters: A-Z a-z 0-9 . -"
+              exit 1 ;;
+          esac
+        fi
+        # Restrict flag inputs to a safe character set so they cannot
+        # inject shell metacharacters (backticks, command substitution,
+        # semicolons, pipes, newlines) into the test command
+        if [ -n "${INPUT_TEST_ARGS}" ]; then
+          case "${INPUT_TEST_ARGS}" in
+            *[!A-Za-z0-9\ ._/=,:@+-]*)
+              echo "Error: invalid test_args ❌"
+              echo "Allowed: A-Z a-z 0-9 space . _ / = , : @ + -"
+              exit 1 ;;
+          esac
+        fi
+        # Package patterns must not smuggle extra flags into go test
+        case "${INPUT_TEST_TARGET}" in
+          *[!A-Za-z0-9\ ._/-]*|'')
+            echo "Error: invalid test_target ❌"
+            echo "Allowed characters: A-Z a-z 0-9 space . _ / -"
+            exit 1 ;;
+        esac
+        # Reject whitespace-only values: they read as an empty
+        # pattern array and go test would silently test the
+        # current directory instead of the documented target
+        case "${INPUT_TEST_TARGET}" in
+          *[!\ ]*) ;;
+          *)
+            echo "Error: invalid test_target ❌"
+            echo "Provide one or more package patterns"
+            exit 1 ;;
+        esac
+        read -r -a test_targets <<< "${INPUT_TEST_TARGET}"
+        for target in "${test_targets[@]}"; do
+          case "${target}" in
+            -*)
+              echo "Error: invalid test_target ❌"
+              echo "Package patterns must not start with '-'"
+              exit 1 ;;
+          esac
+        done
+        # The timeout must parse as a Go duration; the charset check
+        # rejects embedded whitespace/metacharacters and the regex
+        # then enforces digit+unit structure
+        case "${INPUT_TIMEOUT}" in
+          *[!0-9a-z.]*|'')
+            echo "Error: invalid timeout ❌"
+            echo "Expected a Go duration such as 10m or 1h30m"
+            exit 1 ;;
+        esac
+        if ! [[ "${INPUT_TIMEOUT}" =~ \
+          ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$ ]]; then
+          echo "Error: invalid timeout ❌"
+          echo "Expected a Go duration such as 10m or 1h30m"
+          exit 1
+        fi
+        case "${INPUT_ARTIFACT_NAME}" in
+          *[!A-Za-z0-9._-]*|'')
+            echo "Error: invalid artifact_name ❌"
+            echo "Allowed characters: A-Z a-z 0-9 . _ -"
+            exit 1 ;;
+        esac
+        if [ "${INPUT_ARTIFACT_UPLOAD}" = "true" ] && \
+          [ "${INPUT_COVERAGE}" != "true" ]; then
+          echo "Error: artifact_upload requires coverage ❌"
+          echo "Enable coverage to produce an uploadable profile"
+          exit 1
+        fi
+        # Anchor relative paths to GITHUB_WORKSPACE: composite
+        # actions can run with a caller-set working directory, so
+        # resolving against the current directory would be
+        # non-deterministic
+        case "${INPUT_PATH_PREFIX}" in
+          /*) project_dir="${INPUT_PATH_PREFIX}" ;;
+          *) project_dir="${GITHUB_WORKSPACE}/${INPUT_PATH_PREFIX}" ;;
+        esac
+        # Restrict the test run to the workspace: an absolute or
+        # escaped path could otherwise read or write arbitrary runner
+        # filesystem locations. Canonicalize (realpath -m) and
+        # enforce the boundary BEFORE any existence probe so
+        # traversal sequences cannot test for directories outside
+        # the workspace, then re-check after resolving symlinks.
+        # Each realpath call fails closed: an empty result would
+        # degrade the boundary case patterns to /* and disable the
+        # escape checks
+        if ! candidate="$(realpath -m -- "${project_dir}")" ||
+          [ -z "${candidate}" ]; then
+          echo "Error: failed to resolve project directory ❌"
+          exit 1
+        fi
+        if ! workspace="$(realpath -- "${GITHUB_WORKSPACE}")" ||
+          [ -z "${workspace}" ]; then
+          echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        case "${candidate}/" in
+          "${workspace}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        if [ ! -d "${candidate}" ]; then
+          echo "Error: invalid project directory ❌"
+          # Strip CR/LF before logging the untrusted path: embedded
+          # newlines could otherwise inject workflow commands via the
+          # log stream. Parameter expansion avoids an external tr
+          # dependency absent from the preflight tool list
+          sanitized="${candidate//[$'\r\n']/}"
+          printf 'Path not found: %s\n' "${sanitized}"
+          exit 1
+        fi
+        if ! resolved="$(realpath -- "${candidate}")" ||
+          [ -z "${resolved}" ]; then
+          echo "Error: failed to resolve project directory ❌"
+          exit 1
+        fi
+        case "${resolved}/" in
+          "${workspace}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        # Emit either an explicit version or a version file path for
+        # actions/setup-go; the file path can contain characters that
+        # are unsafe for plain key=value output writes, so it uses the
+        # multiline heredoc format with a random delimiter
+        # (regenerated until provably absent from the value) to
+        # prevent output-file injection
+        emit_output() {
+          key="$1"
+          value="$2"
+          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          while [ "${value#*"${delimiter}"}" != "${value}" ]; do
+            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          done
+          {
+            printf '%s<<%s\n' "${key}" "${delimiter}"
+            printf '%s\n' "${value}"
+            printf '%s\n' "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+        }
+        if [ -n "${INPUT_GO_VERSION}" ]; then
+          echo "setup_go_version=${INPUT_GO_VERSION}" >> "$GITHUB_OUTPUT"
+        else
+          case "${INPUT_GO_VERSION_FILE}" in
+            *[!A-Za-z0-9._/-]*|''|/*)
+              echo "Error: invalid go_version_file ❌"
+              echo "Expected a relative path"
+              echo "Allowed characters: A-Z a-z 0-9 . _ / -"
+              exit 1 ;;
+          esac
+          version_file="${resolved}/${INPUT_GO_VERSION_FILE}"
+          # Canonicalize before any existence probe so traversal
+          # sequences cannot test for files outside the project
+          # directory, then re-check after resolving symlinks to
+          # block symlink escapes. Check against the resolved
+          # project directory, not the workspace: go_version_file
+          # is documented as relative to path_prefix, so values
+          # such as ../go.mod must not select a version file from
+          # outside the project directory
+          if ! vf_candidate="$(realpath -m -- "${version_file}")" ||
+            [ -z "${vf_candidate}" ]; then
+            echo "Error: failed to resolve go_version_file ❌"
+            exit 1
+          fi
+          case "${vf_candidate}/" in
+            "${resolved}/"*) ;;
+            *)
+              echo "Error: go_version_file escapes the project ❌"
+              echo "go_version_file must resolve within path_prefix"
+              exit 1 ;;
+          esac
+          if [ ! -f "${vf_candidate}" ]; then
+            echo "Error: go_version_file not found ❌"
+            # Parameter expansion strips CR/LF without an external
+            # tr dependency absent from the preflight tool list
+            sanitized="${vf_candidate//[$'\r\n']/}"
+            printf 'Path not found: %s\n' "${sanitized}"
+            exit 1
+          fi
+          if ! vf_resolved="$(realpath -- "${vf_candidate}")" ||
+            [ -z "${vf_resolved}" ]; then
+            echo "Error: failed to resolve go_version_file ❌"
+            exit 1
+          fi
+          case "${vf_resolved}/" in
+            "${resolved}/"*) ;;
+            *)
+              echo "Error: go_version_file escapes the project ❌"
+              echo "go_version_file must resolve within path_prefix"
+              exit 1 ;;
+          esac
+          emit_output "setup_go_version_file" "${vf_resolved}"
+        fi
+
+    - name: "Setup Go"
+      # yamllint disable-line rule:line-length
+      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      with:
+        go-version: ${{ steps.validate.outputs.setup_go_version }}
+        go-version-file: ${{ steps.validate.outputs.setup_go_version_file }}
+        # Org security stance: no dependency/toolchain caching
+        cache: false
+
+    - name: "Run tests"
+      id: test
+      shell: bash
+      env:
+        PROJECT_DIR: ${{ inputs.path_prefix }}
+        COVERAGE: ${{ inputs.coverage }}
+        RACE: ${{ inputs.race }}
+        TEST_ARGS: ${{ inputs.test_args }}
+        TEST_TARGET: ${{ inputs.test_target }}
+        TEST_TIMEOUT: ${{ inputs.timeout }}
+        PERMIT_FAIL: ${{ inputs.permit_fail }}
+      run: |
+        # Run tests
+        # Anchor relative paths to GITHUB_WORKSPACE so behaviour stays
+        # deterministic when the caller sets a working directory. The
+        # :? expansions hard-fail on unset/empty runner variables,
+        # which would otherwise weaken the boundary checks below
+        case "${PROJECT_DIR}" in
+          /*) ;;
+          *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
+        esac
+        # Re-resolve and enforce the workspace boundary at the point
+        # of use: the workspace is mutable between steps, so relying
+        # solely on the earlier validate step would leave a TOCTOU
+        # gap (a validated directory swapped for an escaping symlink)
+        # Each realpath call fails closed: an empty result would
+        # degrade the boundary case pattern to /* and disable the
+        # escape check
+        if ! PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")" ||
+          [ -z "${PROJECT_DIR}" ]; then
+          echo "Error: failed to resolve project directory ❌"
+          exit 1
+        fi
+        if ! boundary="$(realpath -- "${GITHUB_WORKSPACE:?}")" ||
+          [ -z "${boundary}" ]; then
+          echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        case "${PROJECT_DIR}/" in
+          "${boundary}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        args=(test)
+        if [ "${RACE}" = "true" ]; then
+          args+=(-race)
+        fi
+        cover_file="${PROJECT_DIR}/coverage.out"
+        if [ "${COVERAGE}" = "true" ]; then
+          # Clear any pre-existing profile so a run where go test
+          # fails before writing one cannot report stale coverage
+          # from an earlier run
+          rm -f -- "${cover_file}"
+          args+=(-coverprofile "${cover_file}" -covermode atomic)
+        fi
+        args+=(-timeout "${TEST_TIMEOUT}")
+        # The test_args input passed validation against a strict
+        # character allowlist that excludes quoting and expansion
+        # characters, so whitespace word-splitting is safe here
+        if [ -n "${TEST_ARGS}" ]; then
+          read -r -a extra_args <<< "${TEST_ARGS}"
+          args+=("${extra_args[@]}")
+        fi
+        read -r -a targets <<< "${TEST_TARGET}"
+        args+=("${targets[@]}")
+        if ! cd "${PROJECT_DIR}"; then
+          echo "Error: cannot change to project directory ❌"
+          exit 1
+        fi
+        set +e
+        go "${args[@]}"
+        test_exit=$?
+        set -e
+        if [ "${test_exit}" = "0" ]; then
+          tests_passed="true"
+        else
+          tests_passed="false"
+        fi
+        echo "tests_passed=${tests_passed}" >> "$GITHUB_OUTPUT"
+        # Parse the total coverage percentage; guard on the profile
+        # existing because a compilation failure produces none. With
+        # a profile present, parsing fails closed: a cover tool
+        # failure or a missing total: line is an action malfunction,
+        # not a test failure, so permit_fail does not soften it
+        coverage_percent=""
+        if [ "${COVERAGE}" = "true" ] && [ -f "${cover_file}" ]; then
+          if ! cover_report="$(go tool cover -func "${cover_file}")"
+          then
+            echo "Error: go tool cover failed ❌"
+            exit 1
+          fi
+          coverage_percent="$(printf '%s\n' "${cover_report}" \
+            | awk '/^total:/ {sub(/%$/, "", $NF); print $NF}')"
+          if [ -z "${coverage_percent}" ]; then
+            echo "Error: no total: line in coverage output ❌"
+            exit 1
+          fi
+          # Strict numeric validation (integer or decimal): the
+          # character-class check alone would accept malformed
+          # values such as 1.2.3, and downstream consumers parse
+          # this output as a number
+          if ! [[ "${coverage_percent}" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+          then
+            echo "Error: unexpected coverage output ❌"
+            exit 1
+          fi
+          # The coverage profile path derives from the
+          # caller-controlled path_prefix and can legally contain
+          # characters unsafe for plain key=value output writes, so
+          # it uses the multiline heredoc format with a random
+          # delimiter (regenerated until provably absent from the
+          # value) to prevent output-file injection
+          emit_output() {
+            key="$1"
+            value="$2"
+            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+            while [ "${value#*"${delimiter}"}" != "${value}" ]; do
+              delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+            done
+            {
+              printf '%s<<%s\n' "${key}" "${delimiter}"
+              printf '%s\n' "${value}"
+              printf '%s\n' "${delimiter}"
+            } >> "$GITHUB_OUTPUT"
+          }
+          emit_output "coverage_path" "${cover_file}"
+        elif [ "${COVERAGE}" = "true" ]; then
+          # No profile despite coverage on (compilation failure or
+          # similar): emit an explicit zero so numeric consumers of
+          # coverage_percent keep working on soft-fail paths
+          coverage_percent="0"
+        fi
+        echo "coverage_percent=${coverage_percent}" >> "$GITHUB_OUTPUT"
         {
-          printf '%s<<%s\n' 'output' "$delimiter"
-          printf '%s\n' "$input"
-          printf '%s\n' "$delimiter"
-        } >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "## 🧪 Go Test Results"
+          echo ""
+          echo "**Target:** ${TEST_TARGET}"
+          echo "**Race Detector:** ${RACE}"
+          if [ "${tests_passed}" = "true" ]; then
+            echo "**Result:** passed ✅"
+          else
+            echo "**Result:** failed ❌"
+          fi
+          if [ -n "${coverage_percent}" ]; then
+            echo "**Coverage:** ${coverage_percent}%"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [ "${tests_passed}" != "true" ]; then
+          if [ "${PERMIT_FAIL}" = "true" ]; then
+            echo "::warning::Tests failed; continuing" \
+              "(permit_fail: true)"
+            exit 0
+          fi
+          echo "::error::Tests failed ❌"
+          exit 1
+        fi
+        echo "Tests passed ✅"
+
+    - name: "Upload coverage artifact"
+      # Skip when the test step produced no profile (compilation
+      # failure or a soft-failed run): an empty path would fail the
+      # upload even with permit_fail enabled
+      if: >-
+        inputs.artifact_upload == 'true' &&
+        steps.test.outputs.coverage_path != ''
+      # yamllint disable-line rule:line-length
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: ${{ steps.test.outputs.coverage_path }}
+        if-no-files-found: error

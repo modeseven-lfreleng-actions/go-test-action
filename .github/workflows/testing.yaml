@@ -1,6 +1,6 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Action test/validation workflow
 name: "Test GitHub Action 🧪"
@@ -20,26 +20,26 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
+  ### Test runs against the synthetic Go fixture ###
+  test-synthetic:
+    name: "Test: synthetic fixture (test-go-project)"
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 15
     steps:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
         with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
       # Harden the runner with the just-loaded allow-list.
-      - name: 'Harden runner (block)'
+      - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -50,41 +50,369 @@ jobs:
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
+      - name: "Checkout test project: lfreleng-actions/test-go-project"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: lfreleng-actions/test-go-project
+          ref: a77c5ec773edc266ddcc3c1d1c306e7bb3f12c30
+          path: test-project
+          persist-credentials: false
+
+      # The pinned fixture commit imports pkg/calculator, but the
+      # package never made it into the tree (masked by a .gitignore
+      # entry). Restore a minimal implementation so build and test
+      # operations succeed; drop this step once the fixture repo
+      # gains the package upstream.
+      - name: "Restore missing fixture package"
         shell: bash
         run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Restore missing fixture package
+          mkdir -p test-project/pkg/calculator
+          cat > test-project/pkg/calculator/calculator.go << 'EOF'
+          // SPDX-License-Identifier: Apache-2.0
+          // SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-      - name: "Running local action: ${{ github.repository }}"
+          package calculator
+
+          import "errors"
+
+          type Calculator struct{}
+
+          func New() *Calculator { return &Calculator{} }
+
+          func (c *Calculator) Add(a, b float64) float64 { return a + b }
+
+          func (c *Calculator) Subtract(a, b float64) float64 {
+              return a - b
+          }
+
+          func (c *Calculator) Multiply(a, b float64) float64 {
+              return a * b
+          }
+
+          func (c *Calculator) Divide(a, b float64) (float64, error) {
+              if b == 0 {
+                  return 0, errors.New("division by zero")
+              }
+              return a / b, nil
+          }
+          EOF
+          cat > test-project/pkg/calculator/calculator_test.go << 'EOF'
+          // SPDX-License-Identifier: Apache-2.0
+          // SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+          package calculator
+
+          import "testing"
+
+          func TestOperations(t *testing.T) {
+              c := New()
+              if got := c.Add(2, 3); got != 5 {
+                  t.Fatalf("Add: got %v", got)
+              }
+              if got := c.Subtract(5, 3); got != 2 {
+                  t.Fatalf("Subtract: got %v", got)
+              }
+              if got := c.Multiply(4, 3); got != 12 {
+                  t.Fatalf("Multiply: got %v", got)
+              }
+              if got, err := c.Divide(10, 4); err != nil || got != 2.5 {
+                  t.Fatalf("Divide: got %v err %v", got, err)
+              }
+              if _, err := c.Divide(1, 0); err == nil {
+                  t.Fatal("Divide by zero: expected error")
+              }
+          }
+          EOF
+          echo "Fixture package restored ✅"
+
+      - name: "Running local action: coverage and race defaults"
+        id: default-test
         uses: ./
         with:
-          input: "test input 💬"
+          path_prefix: test-project
 
-      - name: "Validated local action: ${{ github.repository }}"
+      - name: "Running local action: plain run without coverage"
+        id: plain-test
+        uses: ./
+        with:
+          path_prefix: test-project
+          coverage: 'false'
+          race: 'false'
+          test_args: '-count=1'
+          test_target: './pkg/...'
+          timeout: '5m'
+
+      - name: "Running local action: coverage artifact upload"
+        id: coverage-artifact
+        uses: ./
+        with:
+          path_prefix: test-project
+          artifact_upload: 'true'
+          artifact_name: go-coverage-synthetic
+
+      - name: "Verify test outputs"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          DEFAULT_PASSED: ${{ steps.default-test.outputs.tests_passed }}
+          DEFAULT_COVERAGE: >-
+            ${{ steps.default-test.outputs.coverage_percent }}
+          PLAIN_PASSED: ${{ steps.plain-test.outputs.tests_passed }}
+          PLAIN_COVERAGE: >-
+            ${{ steps.plain-test.outputs.coverage_percent }}
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Verify test outputs
+          errors=0
+          if [ "${DEFAULT_PASSED}" != "true" ]; then
+            echo "Default run: tests_passed not true ❌"
+            errors=1
+          fi
+          # Regex validation: integer or decimal with any number of
+          # places, since go tool cover output formatting is not
+          # guaranteed to stay at one decimal place across versions
+          if ! [[ "${DEFAULT_COVERAGE}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Default run: coverage not numeric ❌"
+            echo "Reported coverage: ${DEFAULT_COVERAGE}"
+            errors=1
+          fi
+          if [ "${PLAIN_PASSED}" != "true" ]; then
+            echo "Plain run: tests_passed not true ❌"
+            errors=1
+          fi
+          if [ -n "${PLAIN_COVERAGE}" ]; then
+            echo "Plain run: unexpected coverage output ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Test verification failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Test outputs verified ✅"
+          echo "Coverage reported: ${DEFAULT_COVERAGE}%"
+          {
+            echo "Test outputs verified ✅"
+            echo "Coverage reported: ${DEFAULT_COVERAGE}%"
+          } >> "$GITHUB_STEP_SUMMARY"
 
+  ### Test runs against a real Gerrit-mirrored monorepo ###
+  test-real:
+    name: "Test: real fixture (onap/multicloud-k8s)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: ./
-        id: failure
-        continue-on-error: true
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
         with:
-          invalid_input: "Some garbage"
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test project: onap/multicloud-k8s"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: onap/multicloud-k8s
+          ref: 5c3b1a96811024e65b0977305b6d6737a6e2d453
+          path: test-project
+          persist-credentials: false
+
+      # The module's go.mod predates the go directive conventions the
+      # current toolchain expects (go 1.16), so the runs pass an
+      # explicit modern Go version. The internal/config and
+      # internal/utils packages hold self-contained unit tests that
+      # pass without external services.
+      - name: "Running local action: passing package subset"
+        id: subset-test
+        uses: ./
+        with:
+          path_prefix: test-project/src/k8splugin
+          go_version: '1.25.11'
+          test_target: './internal/config/... ./internal/utils/...'
+
+      # The internal/app package tests require a pre-compiled mock
+      # plugin absent from the repository, so the full internal tree
+      # fails deterministically: the exact case the permit_fail
+      # soft-fail mode covers
+      - name: "Running local action: soft fail on failing suite"
+        id: soft-fail
+        uses: ./
+        with:
+          path_prefix: test-project/src/k8splugin
+          go_version: '1.25.11'
+          test_target: './internal/...'
+          race: 'false'
+          permit_fail: 'true'
+
+      - name: "Running local action: hard fail on failing suite"
+        id: hard-fail
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: test-project/src/k8splugin
+          go_version: '1.25.11'
+          test_target: './internal/...'
+          race: 'false'
+
+      - name: "Verify soft/hard failure semantics"
         shell: bash
+        env:
+          SUBSET_PASSED: ${{ steps.subset-test.outputs.tests_passed }}
+          SUBSET_COVERAGE: >-
+            ${{ steps.subset-test.outputs.coverage_percent }}
+          SOFT_OUTCOME: ${{ steps.soft-fail.outcome }}
+          SOFT_PASSED: ${{ steps.soft-fail.outputs.tests_passed }}
+          HARD_OUTCOME: ${{ steps.hard-fail.outcome }}
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          # Verify soft/hard failure semantics
+          errors=0
+          if [ "${SUBSET_PASSED}" != "true" ]; then
+            echo "Subset run: tests_passed not true ❌"
+            errors=1
+          fi
+          if [ -z "${SUBSET_COVERAGE}" ]; then
+            echo "Subset run: coverage_percent empty ❌"
+            errors=1
+          fi
+          if [ "${SOFT_OUTCOME}" != "success" ]; then
+            echo "Soft-fail run unexpectedly failed ❌"
+            errors=1
+          fi
+          if [ "${SOFT_PASSED}" != "false" ]; then
+            echo "Soft-fail run: tests_passed not false ❌"
+            errors=1
+          fi
+          if [ "${HARD_OUTCOME}" = "success" ]; then
+            echo "Hard-fail run unexpectedly succeeded ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Failure semantics tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Soft/hard failure semantics verified ✅"
+          echo "Soft/hard failure semantics verified ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test invalid inputs fail closed ###
+  test-failures:
+    name: "Test: invalid inputs and error handling"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: "Running local action with shell metacharacter args"
+        id: bad-args
+        continue-on-error: true
+        uses: ./
+        with:
+          test_args: '-run $(id)'
+
+      - name: "Running local action with invalid timeout"
+        id: bad-timeout
+        continue-on-error: true
+        uses: ./
+        with:
+          timeout: '10 minutes'
+
+      - name: "Running local action with workspace-escaping path"
+        id: escape-path
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: /etc
+
+      - name: "Running local action with invalid boolean"
+        id: bad-bool
+        continue-on-error: true
+        uses: ./
+        with:
+          coverage: 'yes'
+
+      - name: "Running local action with upload but no coverage"
+        id: upload-no-coverage
+        continue-on-error: true
+        uses: ./
+        with:
+          coverage: 'false'
+          artifact_upload: 'true'
+
+      - name: "Running local action with flag-like test target"
+        id: bad-target
+        continue-on-error: true
+        uses: ./
+        with:
+          test_target: '-x'
+
+      - name: "Verify invalid inputs were rejected"
+        shell: bash
+        env:
+          ARGS_OUTCOME: ${{ steps.bad-args.outcome }}
+          TIMEOUT_OUTCOME: ${{ steps.bad-timeout.outcome }}
+          ESCAPE_OUTCOME: ${{ steps.escape-path.outcome }}
+          BOOL_OUTCOME: ${{ steps.bad-bool.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload-no-coverage.outcome }}
+          TARGET_OUTCOME: ${{ steps.bad-target.outcome }}
+        run: |
+          # Failure testing is also important; all steps MUST fail
+          errors=0
+          for outcome_pair in \
+            "args:${ARGS_OUTCOME}" \
+            "timeout:${TIMEOUT_OUTCOME}" \
+            "escape:${ESCAPE_OUTCOME}" \
+            "bool:${BOOL_OUTCOME}" \
+            "upload:${UPLOAD_OUTCOME}" \
+            "target:${TARGET_OUTCOME}"; do
+            test_name="${outcome_pair%%:*}"
+            outcome="${outcome_pair#*:}"
+            if [ "${outcome}" = "success" ]; then
+              echo "Invalid ${test_name} unexpectedly succeeded ❌"
+              errors=1
+            fi
+          done
+          if [ "${errors}" != "0" ]; then
+            echo "Failure-path tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Invalid inputs correctly rejected ✅"
+          echo "Invalid inputs correctly rejected ✅" \
+            >> "$GITHUB_STEP_SUMMARY"

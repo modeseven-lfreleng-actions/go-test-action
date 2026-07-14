@@ -269,6 +269,18 @@ jobs:
           test_target: './internal/...'
           race: 'false'
 
+      # The make_args path runs the project's own Makefile via
+      # make-action, which compiles the mock plugin before 'go test'.
+      # That satisfies the internal/app tests that fail on the plain
+      # go test path above, so the full suite passes end-to-end.
+      - name: "Running local action: build+test via make"
+        id: make-test
+        uses: ./
+        with:
+          path_prefix: test-project/src/k8splugin
+          go_version: '1.25.11'
+          make_args: 'test'
+
       - name: "Verify soft/hard failure semantics"
         shell: bash
         env:
@@ -278,6 +290,8 @@ jobs:
           SOFT_OUTCOME: ${{ steps.soft-fail.outcome }}
           SOFT_PASSED: ${{ steps.soft-fail.outputs.tests_passed }}
           HARD_OUTCOME: ${{ steps.hard-fail.outcome }}
+          MAKE_OUTCOME: ${{ steps.make-test.outcome }}
+          MAKE_PASSED: ${{ steps.make-test.outputs.tests_passed }}
         run: |
           # Verify soft/hard failure semantics
           errors=0
@@ -299,6 +313,16 @@ jobs:
           fi
           if [ "${HARD_OUTCOME}" = "success" ]; then
             echo "Hard-fail run unexpectedly succeeded ❌"
+            errors=1
+          fi
+          # The make_args path must compile the plugin and pass the
+          # full suite, including internal/app
+          if [ "${MAKE_OUTCOME}" != "success" ]; then
+            echo "make run unexpectedly failed ❌"
+            errors=1
+          fi
+          if [ "${MAKE_PASSED}" != "true" ]; then
+            echo "make run: tests_passed not true ❌"
             errors=1
           fi
           if [ "${errors}" != "0" ]; then

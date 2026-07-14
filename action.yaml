@@ -49,6 +49,11 @@ inputs:
     description: "Go test timeout as a Go duration string, e.g. 10m or 1h30m"
     required: false
     default: "10m"
+  make_args:
+    # yamllint disable-line rule:line-length
+    description: "When set, run the project's Makefile via make-action instead of the built-in 'go test' (a build+test hook for projects that must run build steps first, e.g. compiling Go plugins). Runs 'make -C <path_prefix> <make_args>'. The coverage, race, test_args, test_target and timeout inputs do not apply on this path; the Makefile controls the run. Must not include -C/--directory. Allowed characters: A-Z a-z 0-9 space . _ / = , : @ + -"
+    required: false
+    default: ""
   permit_fail:
     # yamllint disable-line rule:line-length
     description: "Report test failures without failing the action: 'true' or 'false'"
@@ -67,7 +72,8 @@ inputs:
 outputs:
   tests_passed:
     description: "Whether the test run passed: 'true' or 'false'"
-    value: ${{ steps.test.outputs.tests_passed }}
+    # yamllint disable-line rule:line-length
+    value: ${{ steps.test.outputs.tests_passed || steps.make_result.outputs.tests_passed }}
   coverage_percent:
     # yamllint disable-line rule:line-length
     description: "Total coverage percentage from go tool cover; empty when coverage is off, 0 when the run produced no profile"
@@ -88,6 +94,7 @@ runs:
         INPUT_TEST_ARGS: ${{ inputs.test_args }}
         INPUT_TEST_TARGET: ${{ inputs.test_target }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_MAKE_ARGS: ${{ inputs.make_args }}
         INPUT_PERMIT_FAIL: ${{ inputs.permit_fail }}
         INPUT_ARTIFACT_UPLOAD: ${{ inputs.artifact_upload }}
         INPUT_ARTIFACT_NAME: ${{ inputs.artifact_name }}
@@ -284,6 +291,56 @@ runs:
             printf '%s\n' "${delimiter}"
           } >> "$GITHUB_OUTPUT"
         }
+        # make_args opts into the Makefile-driven test path (run via
+        # make-action) for projects that must perform build steps
+        # before tests, e.g. compiling Go plugins. Restrict it to the
+        # same safe character set as test_args so it cannot inject
+        # shell metacharacters, and reject a caller-supplied
+        # -C/--directory: the action sets the working directory from
+        # path_prefix itself and passes it as 'make -C <project_dir>'
+        if [ -n "${INPUT_MAKE_ARGS}" ]; then
+          # Reject whitespace-only make_args: it is non-empty, so the
+          # workflow-level make_args guard still routes onto the
+          # Makefile path, yet it carries no target and would run
+          # 'make -C <dir>' with the default goal. Fail closed with a
+          # clear error rather than silently switching modes.
+          case "${INPUT_MAKE_ARGS}" in
+            *[![:space:]]*) ;;
+            *)
+              echo "Error: make_args must not be whitespace-only ❌"
+              exit 1 ;;
+          esac
+          case "${INPUT_MAKE_ARGS}" in
+            *[!A-Za-z0-9\ ._/=,:@+-]*)
+              echo "Error: invalid make_args ❌"
+              echo "Allowed: A-Z a-z 0-9 space . _ / = , : @ + -"
+              exit 1 ;;
+          esac
+          read -r -a make_arg_tokens <<< "${INPUT_MAKE_ARGS}"
+          for make_arg in "${make_arg_tokens[@]}"; do
+            # Reject -C/--directory in every form GNU make accepts,
+            # including the concatenated -C<dir> (no space) and
+            # --directory=<dir>: the action derives the working
+            # directory from path_prefix and must stay the sole source
+            case "${make_arg}" in
+              -C*|--directory|--directory=*)
+                echo "Error: invalid make_args ❌"
+                echo "Do not pass -C/--directory; set path_prefix"
+                exit 1 ;;
+            esac
+          done
+          # make-action expands make_args unquoted (word-splitting),
+          # so a project directory containing whitespace cannot be
+          # represented as 'make -C <dir>'; fail closed rather than
+          # silently running make in the wrong directory
+          case "${resolved}" in
+            *[[:space:]]*)
+              echo "Error: resolved path_prefix contains whitespace ❌"
+              echo "make_args does not support paths with whitespace"
+              exit 1 ;;
+          esac
+          emit_output "project_dir" "${resolved}"
+        fi
         if [ -n "${INPUT_GO_VERSION}" ]; then
           echo "setup_go_version=${INPUT_GO_VERSION}" >> "$GITHUB_OUTPUT"
         else
@@ -347,8 +404,64 @@ runs:
         # Org security stance: no dependency/toolchain caching
         cache: false
 
+    # Makefile-driven path: delegate the test run to make-action so a
+    # project's own build+test target executes (e.g. compiling Go
+    # plugins before 'go test'). continue-on-error keeps the failure
+    # recoverable so the report step below can honour permit_fail.
+    - name: "Run tests via make"
+      id: make_test
+      if: inputs.make_args != ''
+      continue-on-error: true
+      # yamllint disable-line rule:line-length
+      uses: lfreleng-actions/make-action@c8ee1397ffedaf3ae5b01c526abda06e1a2a4f54 # v0.1.4
+      with:
+        # yamllint disable-line rule:line-length
+        make_args: "-C ${{ steps.validate.outputs.project_dir }} ${{ inputs.make_args }}"
+
+    - name: "Report make test result"
+      id: make_result
+      if: inputs.make_args != ''
+      shell: bash
+      env:
+        MAKE_OUTCOME: ${{ steps.make_test.outcome }}
+        MAKE_ARGS: ${{ inputs.make_args }}
+        PROJECT_DIR: ${{ steps.validate.outputs.project_dir }}
+        PERMIT_FAIL: ${{ inputs.permit_fail }}
+      run: |
+        # Report make test result
+        if [ "${MAKE_OUTCOME}" = "success" ]; then
+          tests_passed="true"
+        else
+          tests_passed="false"
+        fi
+        echo "tests_passed=${tests_passed}" >> "$GITHUB_OUTPUT"
+        {
+          echo "## 🧪 Go Test Results (make)"
+          echo ""
+          # Report the full invocation, including the -C <dir> the
+          # previous step derives from path_prefix, so the summary
+          # matches what actually ran
+          echo "**Command:** make -C ${PROJECT_DIR} ${MAKE_ARGS}"
+          if [ "${tests_passed}" = "true" ]; then
+            echo "**Result:** passed ✅"
+          else
+            echo "**Result:** failed ❌"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [ "${tests_passed}" != "true" ]; then
+          if [ "${PERMIT_FAIL}" = "true" ]; then
+            echo "::warning::make tests failed; continuing" \
+              "(permit_fail: true)"
+            exit 0
+          fi
+          echo "::error::make tests failed ❌"
+          exit 1
+        fi
+        echo "make tests passed ✅"
+
     - name: "Run tests"
       id: test
+      if: inputs.make_args == ''
       shell: bash
       env:
         PROJECT_DIR: ${{ inputs.path_prefix }}

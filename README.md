@@ -73,6 +73,7 @@ build, to `proxy.golang.org` and `sum.golang.org`.
 | test_args       | False    | `''`          | Extra `go test` flags (restricted character set)                                                      |
 | test_target     | False    | `./...`       | Space-separated package pattern(s) to test                                                            |
 | timeout         | False    | `10m`         | Go test timeout as a Go duration string, e.g. `10m` or `1h30m`                                        |
+| make_args       | False    | `''`          | When set, run the project's Makefile via make-action instead of the built-in `go test` (see below)    |
 | permit_fail     | False    | `false`       | Report test failures without failing the action                                                       |
 | artifact_upload | False    | `false`       | Upload the coverage profile as an artifact; requires coverage; skips when the run produced no profile |
 | artifact_name   | False    | `go-coverage` | Artifact name (restricted character set)                                                              |
@@ -159,13 +160,48 @@ steps:
 
 <!-- markdownlint-enable MD046 -->
 
+## Makefile-Driven Tests (`make_args`)
+
+Some projects must run build steps before `go test`, for example
+compiling a Go plugin that the test suite loads at runtime (ONAP
+`multicloud/k8s` builds a mock plugin in its `test` target). For
+these, set `make_args` to delegate the whole run to the project's own
+Makefile through the pinned
+[`make-action`](https://github.com/lfreleng-actions/make-action). The
+action runs `make -C <path_prefix> <make_args>` and skips the
+built-in `go test` invocation:
+
+<!-- markdownlint-disable MD046 -->
+
+```yaml
+steps:
+  - name: "Build plugin and run tests via make"
+    uses: lfreleng-actions/go-test-action@main
+    with:
+      path_prefix: 'src/k8splugin'
+      go_version: '1.25.11'
+      make_args: 'test'
+```
+
+<!-- markdownlint-enable MD046 -->
+
+On this path the `coverage`, `race`, `test_args`, `test_target` and
+`timeout` inputs do not apply; the Makefile controls how tests run,
+and `coverage_percent` stays empty. `permit_fail` still applies: a
+failing `make` run reports through the step summary and emits
+`tests_passed: false` without failing the action when
+`permit_fail: true`. `make_args` accepts the same character allowlist
+as `test_args` and must not contain `-C`/`--directory`; the action
+derives the working directory from `path_prefix` and passes it as
+`make -C <path_prefix>` itself.
+
 ## Implementation Details
 
 <!-- markdownlint-disable MD013 -->
 
 1. **Input Validation**: Validates booleans, flag character allowlists, the timeout duration format, artifact naming and path boundaries before use
 2. **Toolchain Setup**: Installs Go via the pinned `actions/setup-go` with `cache: false` (organisation security stance on cache poisoning)
-3. **Test Run**: Runs `go test` in the project directory with the requested race/coverage flags (`-covermode atomic`) and timeout, then parses the total coverage from `go tool cover -func`
+3. **Test Run**: Runs `go test` in the project directory with the requested race/coverage flags (`-covermode atomic`) and timeout, then parses the total coverage from `go tool cover -func`. Setting `make_args` skips this step and instead runs the pinned `make-action` as `make -C <path_prefix> <make_args>`
 4. **Outputs and Summary**: Emits pass/fail and coverage outputs plus a step summary; the optional artifact upload uses the pinned `actions/upload-artifact` and skips when the run produced no coverage profile
 
 <!-- markdownlint-enable MD013 -->
